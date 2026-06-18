@@ -1,0 +1,426 @@
+"""
+classifier.py — llama-server classifier factory with 3-pass detection
+======================================================================
+Connects to a locally running llama-server instance via HTTP.
+Works with ANY model served by llama-server (Qwen3.6-35B-A3B-MTP,
+Qwen3-14B, Mistral, etc.) — the server handles all model specifics.
+
+Three-pass strategy (when USE_IMPROVED_CLASSIFIER=True):
+  Pass 1 — Broad detection per chunk: "which signals exist?"
+  Pass 2 — Deep extraction per signal: one focused prompt each
+  Pass 3 — Self-verification: model checks its own answers
+
+Single-pass fallback (USE_IMPROVED_CLASSIFIER=False):
+  One combined prompt, faster but ~15-20% lower recall.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import time
+from dataclasses import dataclass, field
+from typing import Optional
+
+import requests
+
+import config
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Result dataclass
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass
+class SignalResult:
+    company:             str
+    sector_change:       bool = False
+    hq_change:           bool = False
+    hq_region:           str  = ""
+    ma_spinoff:          bool = False
+    renaming:            bool = False
+    operational_change:  bool = False
+    shutdown:            bool = False
+    bankruptcy:          bool = False
+    total_signals:       int  = 0
+
+    sector_detail:       str = ""
+    hq_detail:           str = ""
+    ma_detail:           str = ""
+    rename_detail:       str = ""
+    ops_detail:          str = ""
+    bankruptcy_detail:   str = ""
+    summary:             str = ""
+    sources:             list[str] = field(default_factory=list)
+
+    def recount(self) -> None:
+        """Recompute total_signals from boolean flags."""
+        self.total_signals = sum([
+            self.sector_change, self.hq_change, self.ma_spinoff,
+            self.renaming, self.operational_change, self.bankruptcy,
+        ])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# llama-server HTTP backend
+# ─────────────────────────────────────────────────────────────────────────────
+class LlamaServerClient:
+    """
+    Thin OpenAI-compatible client for llama-server.
+    Raises ConnectionError if server is not reachable at startup.
+    """
+
+    def __init__(
+        self,
+        url:     str = config.LLAMA_SERVER_URL,
+        timeout: int = config.LLAMA_SERVER_TIMEOUT,
+    ):
+        self.completions_url = url.rstrip("/") + "/v1/chat/completions"
+        self.health_url      = url.rstrip("/") + "/health"
+        self.timeout         = timeout
+        self._verify()
+
+    def _verify(self) -> None:
+        for attempt in range(3):
+            try:
+                r = requests.get(self.health_url, timeout=5)
+                if r.status_code == 200:
+                    print(f"  llama-server OK  →  {self.health_url.replace('/health','')}")
+                    return
+            except requests.ConnectionError:
+                pass
+            time.sleep(2)
+        raise ConnectionError(
+            f"\nllama-server not reachable at {self.health_url}\n\n"
+            "Start it first:\n"
+            "  llama-server.exe \\\n"
+            "    -m C:/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \\\n"
+            "    --threads 14 -c 8192 \\\n"
+            "    --spec-type draft-mtp --spec-draft-n-max 2 \\\n"
+            "    --host 127.0.0.1 --port 8080\n"
+        )
+
+    def chat(
+        self,
+        messages:    list[dict],
+        max_tokens:  int   = 600,
+        temperature: float = 0.0,
+    ) -> str:
+        """Call the server and return the assistant message content."""
+        payload = {
+            "messages":    messages,
+            "temperature": temperature,
+            "max_tokens":  max_tokens,
+            "stream":      False,
+        }
+        try:
+            r = requests.post(
+                self.completions_url,
+                json    = payload,
+                timeout = self.timeout,
+            )
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"].strip()
+        except requests.Timeout:
+            print("  [llama-server timeout — returning empty]")
+            return "{}"
+        except Exception as e:
+            print(f"  [llama-server error] {e}")
+            return "{}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Prompt templates
+# ─────────────────────────────────────────────────────────────────────────────
+_SYSTEM = (
+    "/no_think\n"
+    "You are a senior corporate intelligence analyst. Be precise and conservative.\n"
+    "Only flag signals explicitly supported by the text provided.\n"
+    "Respond ONLY with valid JSON — no commentary, no markdown fences."
+)
+
+_PASS1 = """\
+Read the text about "{company}" and identify which corporate change signals are present.
+
+SIGNALS:
+- sector_change    : company changed its primary industry or sector
+- hq_change        : HQ relocation OR legal redomicile to another country/state
+- ma_spinoff       : merger, acquisition, takeover, spinoff, or major divestiture
+- renaming         : legal name change or major brand rename
+- operational_change: major restructuring, significant site closure, or workforce cut >5%
+- shutdown         : entity fully wound down / dissolved / all capital returned
+- bankruptcy       : bankruptcy, administration, insolvency, or liquidation filing
+
+TEXT:
+{context}
+
+Respond with JSON only:
+{{"detected": ["signal_name", ...], "confidence": 1-5}}
+If nothing: {{"detected": [], "confidence": 1}}"""
+
+_PASS2 = """\
+Signal "{signal}" was detected for company "{company}".
+Extract the precise details from the text below.
+
+TEXT:
+{context}
+
+Respond with JSON only:
+{{
+  "confirmed": true/false,
+  "detail": "one sentence: what happened, when, who was involved — cite a date if present",
+  "hq_region": "if hq_change: USA West | USA New York | USA Midwest | USA South | USA Boston | USA Northeast — or country name. Else empty string.",
+  "is_shutdown": true/false,
+  "confidence": 1-5
+}}
+Rules:
+- confirmed=false if evidence is weak or ambiguous
+- is_shutdown=true ONLY if entity fully ceased (wound down, dissolved, absorbed with no brand successor)
+- confidence 5=multiple corroborating sources with dates, 3=single clear source, 1=inferred"""
+
+_PASS3 = """\
+You extracted these signals for "{company}":
+{extracted_json}
+
+Re-read the source text and verify each is genuinely supported.
+TEXT:
+{context}
+
+Respond with JSON only:
+{{
+  "verified": {{"signal_name": true/false, ...}},
+  "corrections": {{"signal_name": "corrected detail if needed", ...}}
+}}
+Only include a key in "corrections" if the detail needs changing."""
+
+_SINGLE_PASS = """\
+Analyze the following content about "{company}" and extract all corporate change signals
+from {date_range}.
+
+CONTENT:
+{context}
+
+Return a JSON object with EXACTLY these fields:
+{{
+  "sector_change": true/false, "sector_detail": "one sentence or empty",
+  "hq_change": true/false, "hq_detail": "FROM → TO with date, or empty",
+  "hq_region": "USA sub-region or country if hq_change, else empty",
+  "ma_spinoff": true/false, "ma_detail": "one sentence or empty",
+  "renaming": true/false, "rename_detail": "old name → new name + date, or empty",
+  "operational_change": true/false, "ops_detail": "one sentence or empty",
+  "shutdown": true/false, "shutdown_detail": "one sentence or empty",
+  "bankruptcy": true/false, "bankruptcy_detail": "filing type + date or empty",
+  "summary": "2-3 sentence executive summary of all signals, or 'No significant corporate changes identified.'",
+  "confidence": 1-5
+}}
+shutdown=true ONLY if entity fully ceased to exist.
+hq_change=true ONLY for actual relocation or redomicile, not minor office moves."""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Classifier
+# ─────────────────────────────────────────────────────────────────────────────
+def _parse_json(text: str) -> Optional[dict]:
+    text = re.sub(r"^```(?:json)?\s*", "", text.strip())
+    text = re.sub(r"\s*```$",           "", text.strip())
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group())
+            except Exception:
+                pass
+    return None
+
+
+def _chunks(context: str) -> list[str]:
+    out = []
+    for i in range(0, min(len(context),
+                          config.CONTEXT_CHUNK_SIZE * config.MAX_CONTEXT_CHUNKS),
+                   config.CONTEXT_CHUNK_SIZE):
+        chunk = context[i: i + config.CONTEXT_CHUNK_SIZE]
+        if chunk.strip():
+            out.append(chunk)
+    return out or [context[:config.CONTEXT_CHUNK_SIZE]]
+
+
+class Classifier:
+    """
+    Single entry point.  Automatically uses 3-pass or single-pass
+    based on config.USE_IMPROVED_CLASSIFIER.
+    """
+
+    def __init__(self, client: Optional[LlamaServerClient] = None):
+        self.client = client or LlamaServerClient()
+
+    def _call(self, user_prompt: str, max_tokens: int = 500) -> str:
+        return self.client.chat(
+            messages=[
+                {"role": "system", "content": _SYSTEM},
+                {"role": "user",   "content": user_prompt},
+            ],
+            max_tokens  = max_tokens,
+            temperature = 0.0,
+        )
+
+    # ── single pass ──────────────────────────────────────────────────────────
+    def _single_pass(self, company: str, context: str) -> SignalResult:
+        r   = SignalResult(company=company)
+        raw = self._call(
+            _SINGLE_PASS.format(
+                company    = company,
+                context    = context[:config.CONTEXT_CHUNK_SIZE * config.MAX_CONTEXT_CHUNKS],
+                date_range = config.DATE_RANGE,
+            ),
+            max_tokens=800,
+        )
+        data = _parse_json(raw)
+        if not data:
+            r.summary = f"[parse error] {raw[:120]}"
+            return r
+
+        conf = int(data.get("confidence", 1))
+        if conf < config.MIN_CONFIDENCE:
+            r.summary = f"[low confidence {conf}/5] {data.get('summary','')}"
+            return r
+
+        r.sector_change      = bool(data.get("sector_change"))
+        r.sector_detail      = data.get("sector_detail", "")
+        r.hq_change          = bool(data.get("hq_change"))
+        r.hq_detail          = data.get("hq_detail", "")
+        r.hq_region          = data.get("hq_region", "")
+        r.ma_spinoff         = bool(data.get("ma_spinoff"))
+        r.ma_detail          = data.get("ma_detail", "")
+        r.renaming           = bool(data.get("renaming"))
+        r.rename_detail      = data.get("rename_detail", "")
+        r.operational_change = bool(data.get("operational_change"))
+        r.shutdown           = bool(data.get("shutdown"))
+        ops_parts = [data.get("ops_detail",""), data.get("shutdown_detail","")]
+        r.ops_detail         = " | ".join(p for p in ops_parts if p)
+        r.bankruptcy         = bool(data.get("bankruptcy"))
+        r.bankruptcy_detail  = data.get("bankruptcy_detail", "")
+        r.summary            = data.get("summary", "")
+        r.recount()
+        return r
+
+    # ── three pass ───────────────────────────────────────────────────────────
+    def _three_pass(self, company: str, context: str) -> SignalResult:
+        r      = SignalResult(company=company)
+        chunks = _chunks(context)
+
+        # Pass 1 — detect across all chunks
+        detected: set[str] = set()
+        best_conf = 1
+        for chunk in chunks:
+            raw  = self._call(_PASS1.format(company=company, context=chunk), 150)
+            data = _parse_json(raw)
+            if data:
+                detected.update(data.get("detected") or [])
+                best_conf = max(best_conf, int(data.get("confidence", 1)))
+
+        if not detected or best_conf < config.MIN_CONFIDENCE:
+            r.summary = "No significant corporate changes identified."
+            return r
+
+        # Pass 2 — extract details per signal
+        full_ctx  = context[:config.CONTEXT_CHUNK_SIZE * config.MAX_CONTEXT_CHUNKS]
+        extracted: dict[str, dict] = {}
+        for signal in detected:
+            raw  = self._call(_PASS2.format(
+                signal=signal, company=company, context=full_ctx), 300)
+            data = _parse_json(raw)
+            if (data
+                    and data.get("confirmed")
+                    and int(data.get("confidence", 1)) >= config.MIN_CONFIDENCE):
+                extracted[signal] = data
+
+        if not extracted:
+            r.summary = "Signals detected but none confirmed after extraction."
+            return r
+
+        # Pass 3 — self-verify
+        ext_summary = json.dumps(
+            {k: v.get("detail","") for k, v in extracted.items()}, indent=2
+        )
+        raw  = self._call(_PASS3.format(
+            company=company, extracted_json=ext_summary, context=full_ctx), 350)
+        data = _parse_json(raw)
+        if data:
+            verified    = data.get("verified", {})
+            corrections = data.get("corrections", {})
+            extracted   = {k: v for k, v in extracted.items()
+                           if verified.get(k, True)}
+            for sig, new_detail in corrections.items():
+                if sig in extracted:
+                    extracted[sig]["detail"] = new_detail
+
+        if not extracted:
+            r.summary = "No signals survived verification."
+            return r
+
+        # Map → SignalResult
+        def _d(key: str) -> str:
+            return extracted.get(key, {}).get("detail", "")
+
+        r.sector_change      = "sector_change"      in extracted
+        r.sector_detail      = _d("sector_change")
+        r.hq_change          = "hq_change"          in extracted
+        r.hq_detail          = _d("hq_change")
+        r.hq_region          = extracted.get("hq_change", {}).get("hq_region", "")
+        r.ma_spinoff         = "ma_spinoff"         in extracted
+        r.ma_detail          = _d("ma_spinoff")
+        r.renaming           = "renaming"            in extracted
+        r.rename_detail      = _d("renaming")
+        r.operational_change = "operational_change" in extracted
+        r.shutdown           = (
+            "shutdown" in extracted
+            or extracted.get("operational_change", {}).get("is_shutdown", False)
+        )
+        ops_parts = [_d("operational_change"), _d("shutdown")]
+        r.ops_detail         = " | ".join(p for p in ops_parts if p)
+        r.bankruptcy         = "bankruptcy"         in extracted
+        r.bankruptcy_detail  = _d("bankruptcy")
+
+        lines = [f"{k.replace('_',' ').title()}: {v.get('detail','')}"
+                 for k, v in extracted.items() if v.get("detail")]
+        r.summary = " | ".join(lines) or "Signals confirmed."
+        r.recount()
+        return r
+
+    # ── public entry point ───────────────────────────────────────────────────
+    def classify(self, company: str, context: str, sources: list[str] = None) -> SignalResult:
+        if not context.strip():
+            r = SignalResult(company=company, summary="No content fetched.")
+            return r
+
+        if config.USE_IMPROVED_CLASSIFIER:
+            result = self._three_pass(company, context)
+        else:
+            result = self._single_pass(company, context)
+
+        result.sources = sources or []
+        return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Factory function (for use in pipeline.py)
+# ─────────────────────────────────────────────────────────────────────────────
+def make_classifier() -> Classifier:
+    """
+    Return a ready Classifier instance.
+    Automatically selects backend based on config.USE_DATABRICKS_MODEL:
+      True  → Databricks Foundation Model API (Qwen3 80B or similar)
+      False → local llama-server (Qwen3.6-35B GGUF on your workstation)
+    """
+    if config.USE_DATABRICKS_MODEL:
+        from databricks_client import DatabricksModelClient
+        client = DatabricksModelClient(
+            endpoint = config.DATABRICKS_CLASSIFIER_ENDPOINT,
+        )
+    else:
+        client = LlamaServerClient(
+            url     = config.LLAMA_SERVER_URL,
+            timeout = config.LLAMA_SERVER_TIMEOUT,
+        )
+    return Classifier(client=client)
