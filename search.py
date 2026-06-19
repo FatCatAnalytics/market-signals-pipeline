@@ -80,6 +80,14 @@ def _truncate(text: str, n: int = 600) -> str:
     return text[:n] if len(text) > n else text
 
 
+def _year_terms() -> str:
+    return getattr(config, "SEARCH_YEAR_TERMS", "2025 OR 2026")
+
+
+def _date_range() -> str:
+    return getattr(config, "DATE_RANGE", "Last 12 months")
+
+
 _SESSION = requests.Session()
 _SESSION.headers.update({
     "User-Agent": f"MarketSignalsPipeline/1.0 ({config.EDGAR_USER_AGENT_EMAIL})",
@@ -112,8 +120,8 @@ def _fetch_edgar(company: str, max_filings: int = 5) -> tuple[str, list[str]]:
     params = {
         "q":       f'"{clean}"',
         "dateRange": "custom",
-        "startdt": "2024-01-01",
-        "enddt":   "2026-12-31",
+        "startdt": getattr(config, "DATE_START", "2025-01-01"),
+        "enddt":   getattr(config, "DATE_END", "2026-12-31"),
         "forms":   "8-K",
     }
     r = _get(_EDGAR_SEARCH_URL, params=params)
@@ -153,10 +161,11 @@ _GNEWS_BASE = "https://news.google.com/rss/search"
 
 
 def _fetch_google_news(company: str, seen_urls: set[str], max_items: int = 12) -> tuple[str, list[str]]:
-    clean   = _clean_name(company)
+    clean = _clean_name(company)
+    years = _year_terms()
     queries = [
-        f'"{clean}" merger OR acquisition OR bankruptcy OR shutdown OR restructuring OR rebranding OR renamed OR relocated',
-        f'"{clean}" 2025 OR 2026',
+        f'"{clean}" merger OR acquisition OR bankruptcy OR shutdown OR restructuring OR rebranding OR renamed OR relocated {years}',
+        f'"{clean}" {years}',
     ]
     sections, urls = [], []
 
@@ -206,7 +215,7 @@ def _fetch_ddg(company: str, seen_urls: set[str], max_items: int = 8) -> tuple[s
     Uses a browser-like User-Agent to avoid bot blocks.
     """
     clean = _clean_name(company)
-    query = f'"{clean}" (merger OR acquisition OR bankrupt OR shutdown OR renamed OR "new name" OR relocated OR spinoff) 2025 OR 2026'
+    query = f'"{clean}" (merger OR acquisition OR bankrupt OR shutdown OR renamed OR "new name" OR relocated OR spinoff) {_year_terms()}'
 
     headers = {
         "User-Agent": (
@@ -434,7 +443,7 @@ def fetch_stage1(company: str) -> StageOneResult:
         all_urls.extend(urls)
         breakdown["wikipedia"] = len(ctx)
 
-    full_context   = "\n\n".join(all_sections)
+    full_context = "\n\n".join(all_sections)
     # Headline text: just titles + first line of each section (compact for prescreener)
     headline_lines = []
     for section in all_sections:
@@ -462,12 +471,14 @@ def fetch_stage1(company: str) -> StageOneResult:
 def _build_tavily_queries(company: str) -> list[str]:
     c = _clean_name(company)
     q = f'"{c}"'
+    years = _year_terms()
+    window = _date_range()
     return [
-        f"{q} 2025 OR 2026",
-        f"{q} merger acquisition spinoff divestiture takeover 2025 2026",
-        f"{q} headquarters relocation redomicile incorporated 2025 2026",
-        f"{q} bankruptcy shutdown liquidation closure restructuring 2025 2026",
-        f"{q} renamed rebranded sector pivot new name 2025 2026",
+        f"{q} corporate changes {window}",
+        f"{q} merger acquisition spinoff divestiture takeover {years}",
+        f"{q} headquarters relocation redomicile incorporated {years}",
+        f"{q} bankruptcy shutdown liquidation closure restructuring {years}",
+        f"{q} renamed rebranded sector pivot new name {years}",
     ]
 
 
