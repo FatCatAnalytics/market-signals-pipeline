@@ -31,20 +31,32 @@ TAVILY_SEARCH_DEPTH: str = "advanced"   # "basic" (faster) or "advanced" (better
 USE_DATABRICKS_MODEL: bool = bool(os.environ.get("USE_DATABRICKS_MODEL", "False").strip() in ("1","True","true"))
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DATABRICKS FOUNDATION MODEL API
+# DATABRICKS FOUNDATION MODEL API / MODEL SERVING
 # ─────────────────────────────────────────────────────────────────────────────
 # Workspace URL — e.g. https://adb-1234567890123456.7.azuredatabricks.net
 DATABRICKS_HOST:  str = os.environ.get("DATABRICKS_HOST",  "https://YOUR_WORKSPACE.azuredatabricks.net")
 
 # Personal Access Token — generate in Databricks → Settings → Developer → Access Tokens
-# Inside a Databricks notebook this is injected automatically — leave as empty string.
+# Inside a Databricks notebook/job this is injected automatically by the runner.
 DATABRICKS_TOKEN: str = os.environ.get("DATABRICKS_TOKEN", "")
 
-# Endpoint for Stage 2 classifier (high-quality, larger model)
-DATABRICKS_CLASSIFIER_ENDPOINT:  str = "databricks-qwen3-next-80b-a3b-instruct"
+# Endpoint for Stage 2 classifier (high-quality, larger model).
+# Override from a Databricks Job parameter by setting DATABRICKS_CLASSIFIER_ENDPOINT.
+# Examples:
+#   databricks-qwen3-next-80b-a3b-instruct
+#   qwen3-6-corporate-classifier
+#   your-own-model-serving-endpoint-name
+DATABRICKS_CLASSIFIER_ENDPOINT: str = os.environ.get(
+    "DATABRICKS_CLASSIFIER_ENDPOINT",
+    "databricks-qwen3-next-80b-a3b-instruct",
+)
 
-# Endpoint for Stage 1C prescreener (fast, cheap — fires for every company)
-DATABRICKS_PRESCREENER_ENDPOINT: str = "databricks-meta-llama-3-1-8b-instruct"
+# Endpoint for Stage 1C prescreener (fast, cheap — fires for every company).
+# Override from a Databricks Job parameter by setting DATABRICKS_PRESCREENER_ENDPOINT.
+DATABRICKS_PRESCREENER_ENDPOINT: str = os.environ.get(
+    "DATABRICKS_PRESCREENER_ENDPOINT",
+    "databricks-meta-llama-3-1-8b-instruct",
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOCAL LLAMA-SERVER  (for Qwen3.6-35B-A3B-MTP or any GGUF model)
