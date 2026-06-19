@@ -9,8 +9,12 @@ env/
 
 # Cache / checkpoints
 .search_cache/
+*_checkpoint.json
 *.checkpoint.json
+
+# Runtime logs / generated run metadata
 *.log
+*_prescreen_log.csv
 
 # Secrets / keys — never commit these
 .env
@@ -18,7 +22,12 @@ secrets.py
 
 # Output files
 *.xlsx
+
+# Local/private input files
+input/
+output/
 *.csv
+!company_list_sample.csv
 
 # IDE
 .vscode/
