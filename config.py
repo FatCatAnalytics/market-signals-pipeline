@@ -4,7 +4,42 @@ config.py — central configuration for market_signals_pipeline
 Edit this file before your first run. Everything else reads from here.
 """
 
+import calendar
 import os
+from datetime import date
+
+
+def _bool_env(name: str, default: str = "False") -> bool:
+    return os.environ.get(name, default).strip() in ("1", "True", "true", "YES", "yes")
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)).strip())
+    except Exception:
+        return default
+
+
+def _subtract_months(d: date, months: int) -> date:
+    """Return the date `months` before `d`, clamping day-of-month safely."""
+    month = d.month - months
+    year = d.year
+    while month <= 0:
+        month += 12
+        year -= 1
+    last_day = calendar.monthrange(year, month)[1]
+    return date(year, month, min(d.day, last_day))
+
+
+def _build_date_window(months: int) -> tuple[str, str, str]:
+    today = date.today()
+    start = _subtract_months(today, months)
+    return (
+        start.isoformat(),
+        today.isoformat(),
+        f"{start.isoformat()} – {today.isoformat()} ({months} months)",
+    )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SEC EDGAR  (free, no key — just needs a real email in User-Agent)
@@ -28,7 +63,7 @@ TAVILY_SEARCH_DEPTH: str = "advanced"   # "basic" (faster) or "advanced" (better
 # ─────────────────────────────────────────────────────────────────────────────
 # True  = use Databricks Foundation Model APIs (recommended for Databricks runs)
 # False = use local llama-server (for running on your Windows workstation)
-USE_DATABRICKS_MODEL: bool = bool(os.environ.get("USE_DATABRICKS_MODEL", "False").strip() in ("1","True","true"))
+USE_DATABRICKS_MODEL: bool = _bool_env("USE_DATABRICKS_MODEL", "False")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DATABRICKS FOUNDATION MODEL API / MODEL SERVING
@@ -81,8 +116,25 @@ DEFAULT_OUTPUT_XLS: str = "market_signals_report.xlsx"
 # ─────────────────────────────────────────────────────────────────────────────
 # PIPELINE BEHAVIOUR
 # ─────────────────────────────────────────────────────────────────────────────
-# Date window shown in column headers and summaries
-DATE_RANGE: str = "Nov 2024 – Jun 2026"
+# Time window used in search queries, classifier prompts, and report summaries.
+# Databricks notebook/job can override with TIME_HORIZON_MONTHS = 6, 12, or 24.
+_requested_months = _int_env("TIME_HORIZON_MONTHS", 12)
+TIME_HORIZON_MONTHS: int = _requested_months if _requested_months in (6, 12, 24) else 12
+_DEFAULT_DATE_START, _DEFAULT_DATE_END, _DEFAULT_DATE_RANGE = _build_date_window(TIME_HORIZON_MONTHS)
+DATE_START: str = os.environ.get("DATE_START", _DEFAULT_DATE_START)
+DATE_END:   str = os.environ.get("DATE_END",   _DEFAULT_DATE_END)
+DATE_RANGE: str = os.environ.get("DATE_RANGE", _DEFAULT_DATE_RANGE)
+
+# Useful search term string, e.g. "2025 OR 2026".
+try:
+    _start_year = int(DATE_START[:4])
+    _end_year = int(DATE_END[:4])
+    SEARCH_YEAR_TERMS: str = " OR ".join(str(y) for y in range(_start_year, _end_year + 1))
+except Exception:
+    SEARCH_YEAR_TERMS = "2025 OR 2026"
+
+# Set to 0 to process all rows. Use 10 or 15 for testing.
+DEFAULT_MAX_COMPANIES: int = max(0, _int_env("MAX_COMPANIES", 0))
 
 # Minimum LLM confidence (1–5) to accept a signal.
 # Raise to 3–4 for higher precision. Lower to 1 for maximum recall.
