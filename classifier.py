@@ -140,6 +140,7 @@ _SYSTEM = (
 
 _PASS1 = """\
 Read the text about "{company}" and identify which corporate change signals are present.
+Only consider corporate changes inside this time window: {date_range}.
 
 SIGNALS:
 - sector_change    : company changed its primary industry or sector
@@ -160,6 +161,7 @@ If nothing: {{"detected": [], "confidence": 1}}"""
 _PASS2 = """\
 Signal "{signal}" was detected for company "{company}".
 Extract the precise details from the text below.
+Only confirm the signal if it happened inside this time window: {date_range}.
 
 TEXT:
 {context}
@@ -173,7 +175,7 @@ Respond with JSON only:
   "confidence": 1-5
 }}
 Rules:
-- confirmed=false if evidence is weak or ambiguous
+- confirmed=false if evidence is weak, ambiguous, or outside the time window
 - is_shutdown=true ONLY if entity fully ceased (wound down, dissolved, absorbed with no brand successor)
 - confidence 5=multiple corroborating sources with dates, 3=single clear source, 1=inferred"""
 
@@ -181,7 +183,7 @@ _PASS3 = """\
 You extracted these signals for "{company}":
 {extracted_json}
 
-Re-read the source text and verify each is genuinely supported.
+Re-read the source text and verify each is genuinely supported and inside this time window: {date_range}.
 TEXT:
 {context}
 
@@ -327,7 +329,10 @@ class Classifier:
         detected: set[str] = set()
         best_conf = 1
         for chunk in chunks:
-            raw  = self._call(_PASS1.format(company=company, context=chunk), 150)
+            raw  = self._call(
+                _PASS1.format(company=company, context=chunk, date_range=config.DATE_RANGE),
+                150,
+            )
             data = _parse_json(raw)
             if data:
                 detected.update(data.get("detected") or [])
@@ -342,7 +347,11 @@ class Classifier:
         extracted: dict[str, dict] = {}
         for signal in detected:
             raw  = self._call(_PASS2.format(
-                signal=signal, company=company, context=full_ctx), 300)
+                signal=signal,
+                company=company,
+                context=full_ctx,
+                date_range=config.DATE_RANGE,
+            ), 300)
             data = _parse_json(raw)
             if (data
                     and data.get("confirmed")
@@ -356,9 +365,12 @@ class Classifier:
         # Pass 3 — self-verify
         ext_summary = json.dumps(
             {k: v.get("detail", "") for k, v in extracted.items()}, ensure_ascii=False)
-        raw_v = self._call(_PASS3.format(company=company,
-                                         extracted_json=ext_summary,
-                                         context=full_ctx), 300)
+        raw_v = self._call(_PASS3.format(
+            company=company,
+            extracted_json=ext_summary,
+            context=full_ctx,
+            date_range=config.DATE_RANGE,
+        ), 300)
         vdata = _parse_json(raw_v) or {"verified": {}}
         verified = vdata.get("verified", {})
         corrections = vdata.get("corrections", {})
@@ -399,13 +411,22 @@ class Classifier:
             r.summary = "No significant corporate changes identified after verification."
         return r
 
-    def classify(self, company: str, context: str) -> SignalResult:
+    def classify(
+        self,
+        company: str,
+        context: str,
+        sources: Optional[list[str]] = None,
+    ) -> SignalResult:
         if not context or len(context.strip()) < 80:
-            return SignalResult(company=company,
-                                summary="Insufficient context to classify.")
-        if getattr(config, "USE_IMPROVED_CLASSIFIER", True):
-            return self._three_pass(company, context)
-        return self._single_pass(company, context)
+            result = SignalResult(company=company, summary="Insufficient context to classify.")
+        elif getattr(config, "USE_IMPROVED_CLASSIFIER", True):
+            result = self._three_pass(company, context)
+        else:
+            result = self._single_pass(company, context)
+
+        if sources:
+            result.sources = list(sources)
+        return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
