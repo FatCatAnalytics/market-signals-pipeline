@@ -255,6 +255,20 @@ class Classifier:
         self.client = client or LlamaServerClient()
 
     def _call(self, user_prompt: str, max_tokens: int = 500) -> str:
+        """
+        Call either the local llama-server client or the Databricks client.
+
+        Local LlamaServerClient exposes .chat(messages=...).
+        DatabricksModelClient exposes .complete(system_prompt=..., user_prompt=...).
+        """
+        if hasattr(self.client, "complete"):
+            return self.client.complete(
+                system_prompt=_SYSTEM,
+                user_prompt=user_prompt,
+                max_tokens=max_tokens,
+                temperature=0.0,
+            )
+
         return self.client.chat(
             messages=[
                 {"role": "system", "content": _SYSTEM},
@@ -341,86 +355,72 @@ class Classifier:
 
         # Pass 3 — self-verify
         ext_summary = json.dumps(
-            {k: v.get("detail","") for k, v in extracted.items()}, indent=2
-        )
-        raw  = self._call(_PASS3.format(
-            company=company, extracted_json=ext_summary, context=full_ctx), 350)
-        data = _parse_json(raw)
-        if data:
-            verified    = data.get("verified", {})
-            corrections = data.get("corrections", {})
-            extracted   = {k: v for k, v in extracted.items()
-                           if verified.get(k, True)}
-            for sig, new_detail in corrections.items():
-                if sig in extracted:
-                    extracted[sig]["detail"] = new_detail
+            {k: v.get("detail", "") for k, v in extracted.items()}, ensure_ascii=False)
+        raw_v = self._call(_PASS3.format(company=company,
+                                         extracted_json=ext_summary,
+                                         context=full_ctx), 300)
+        vdata = _parse_json(raw_v) or {"verified": {}}
+        verified = vdata.get("verified", {})
+        corrections = vdata.get("corrections", {})
 
-        if not extracted:
-            r.summary = "No signals survived verification."
-            return r
+        # Map to result fields
+        for sig, d in extracted.items():
+            if not verified.get(sig, True):
+                continue
+            detail = corrections.get(sig) or d.get("detail", "")
+            if sig == "sector_change":
+                r.sector_change = True; r.sector_detail = detail
+            elif sig == "hq_change":
+                r.hq_change = True; r.hq_detail = detail; r.hq_region = d.get("hq_region", "")
+            elif sig == "ma_spinoff":
+                r.ma_spinoff = True; r.ma_detail = detail
+            elif sig == "renaming":
+                r.renaming = True; r.rename_detail = detail
+            elif sig == "operational_change":
+                r.operational_change = True; r.ops_detail = detail
+            elif sig == "bankruptcy":
+                r.bankruptcy = True; r.bankruptcy_detail = detail
+            elif sig == "shutdown":
+                r.operational_change = True
+                r.ops_detail = (r.ops_detail + " | " if r.ops_detail else "") + detail
 
-        # Map → SignalResult
-        def _d(key: str) -> str:
-            return extracted.get(key, {}).get("detail", "")
-
-        r.sector_change      = "sector_change"      in extracted
-        r.sector_detail      = _d("sector_change")
-        r.hq_change          = "hq_change"          in extracted
-        r.hq_detail          = _d("hq_change")
-        r.hq_region          = extracted.get("hq_change", {}).get("hq_region", "")
-        r.ma_spinoff         = "ma_spinoff"         in extracted
-        r.ma_detail          = _d("ma_spinoff")
-        r.renaming           = "renaming"            in extracted
-        r.rename_detail      = _d("renaming")
-        r.operational_change = "operational_change" in extracted
-        r.shutdown           = (
-            "shutdown" in extracted
-            or extracted.get("operational_change", {}).get("is_shutdown", False)
-        )
-        ops_parts = [_d("operational_change"), _d("shutdown")]
-        r.ops_detail         = " | ".join(p for p in ops_parts if p)
-        r.bankruptcy         = "bankruptcy"         in extracted
-        r.bankruptcy_detail  = _d("bankruptcy")
-
-        lines = [f"{k.replace('_',' ').title()}: {v.get('detail','')}"
-                 for k, v in extracted.items() if v.get("detail")]
-        r.summary = " | ".join(lines) or "Signals confirmed."
         r.recount()
+        if r.total_signals:
+            details = []
+            for label, det in [
+                ("sector", r.sector_detail), ("hq", r.hq_detail),
+                ("M&A", r.ma_detail), ("rename", r.rename_detail),
+                ("ops", r.ops_detail), ("bankruptcy", r.bankruptcy_detail),
+            ]:
+                if det:
+                    details.append(f"{label}: {det}")
+            r.summary = "; ".join(details)[:500]
+        else:
+            r.summary = "No significant corporate changes identified after verification."
         return r
 
-    # ── public entry point ───────────────────────────────────────────────────
-    def classify(self, company: str, context: str, sources: list[str] = None) -> SignalResult:
-        if not context.strip():
-            r = SignalResult(company=company, summary="No content fetched.")
-            return r
-
-        if config.USE_IMPROVED_CLASSIFIER:
-            result = self._three_pass(company, context)
-        else:
-            result = self._single_pass(company, context)
-
-        result.sources = sources or []
-        return result
+    def classify(self, company: str, context: str) -> SignalResult:
+        if not context or len(context.strip()) < 80:
+            return SignalResult(company=company,
+                                summary="Insufficient context to classify.")
+        if getattr(config, "USE_IMPROVED_CLASSIFIER", True):
+            return self._three_pass(company, context)
+        return self._single_pass(company, context)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Factory function (for use in pipeline.py)
+# Factory
 # ─────────────────────────────────────────────────────────────────────────────
 def make_classifier() -> Classifier:
     """
-    Return a ready Classifier instance.
-    Automatically selects backend based on config.USE_DATABRICKS_MODEL:
-      True  → Databricks Foundation Model API (Qwen3 80B or similar)
-      False → local llama-server (Qwen3.6-35B GGUF on your workstation)
+    Factory that decides whether to use:
+    - local llama-server client, or
+    - Databricks Foundation Model client
+
+    Controlled by config.USE_DATABRICKS_MODEL.
     """
-    if config.USE_DATABRICKS_MODEL:
-        from databricks_client import DatabricksModelClient
-        client = DatabricksModelClient(
-            endpoint = config.DATABRICKS_CLASSIFIER_ENDPOINT,
-        )
-    else:
-        client = LlamaServerClient(
-            url     = config.LLAMA_SERVER_URL,
-            timeout = config.LLAMA_SERVER_TIMEOUT,
-        )
-    return Classifier(client=client)
+    if getattr(config, "USE_DATABRICKS_MODEL", False):
+        from databricks_client import make_databricks_classifier
+        return Classifier(client=make_databricks_classifier())
+
+    return Classifier()
