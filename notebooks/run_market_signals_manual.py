@@ -27,7 +27,7 @@ dbutils.widgets.text(
 
 dbutils.widgets.text(
     "input_csv",
-    "/Volumes/data_poc_ws/default/client_intelligence_analytics/market_signals/input/company_list.csv",
+    "/Volumes/data_poc_ws/default/client_intelligence_analytics/market_signals/input/corporate_100.csv",
 )
 
 dbutils.widgets.text(
@@ -189,17 +189,25 @@ importlib.reload(classifier)
 importlib.reload(prescreener)
 importlib.reload(pipeline)
 
+import shutil
+import tempfile
 from pipeline import run_pipeline
+
+# Write Excel to local temp file first — Volume FUSE doesn't support seek for zip/xlsx writes
+_tmp_xlsx = os.path.join(tempfile.gettempdir(), os.path.basename(OUTPUT_XLSX))
 
 start = time.time()
 
 results = run_pipeline(
     input_csv=INPUT_CSV,
-    output_xlsx=OUTPUT_XLSX,
+    output_xlsx=_tmp_xlsx,
     tavily_key=config.TAVILY_API_KEY if not config.TAVILY_API_KEY.startswith("tvly-YOUR") else None,
     resume=RESUME,
     max_companies=MAX_COMPANIES,
 )
+
+shutil.copy2(_tmp_xlsx, OUTPUT_XLSX)
+os.remove(_tmp_xlsx)
 
 elapsed = time.time() - start
 mins, secs = divmod(int(elapsed), 60)
