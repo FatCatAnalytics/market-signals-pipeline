@@ -27,7 +27,7 @@ dbutils.widgets.text(
 
 dbutils.widgets.text(
     "input_csv",
-    "/Volumes/data_poc_ws/default/client_intelligence_analytics/market_signals/input/company_list.csv",
+    "/Volumes/data_poc_ws/default/client_intelligence_analytics/market_signals/input/company_list_sample.csv",
 )
 
 dbutils.widgets.text(
@@ -154,16 +154,71 @@ print(f"Model test response: {response.strip()}")
 
 # COMMAND ----------
 
+# DBTITLE 1,Run pipeline
+from databricks_client import DatabricksModelClient
+import requests
+
+# Patch DatabricksModelClient with a .chat() method to match LlamaServerClient interface
+def _db_chat(self, messages, max_tokens=1200, temperature=0.0):
+    payload = {"messages": messages, "max_tokens": max_tokens, "temperature": temperature}
+    headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
+    for attempt in range(3):
+        try:
+            r = requests.post(self.url, headers=headers, json=payload, timeout=self.timeout_sec)
+            if r.status_code == 200:
+                return r.json()["choices"][0]["message"]["content"].strip()
+            if r.status_code == 429:
+                wait = min(int(r.headers.get("Retry-After", 5 * (attempt + 1))), 30)
+                time.sleep(wait)
+                continue
+            if r.status_code in (500, 502, 503, 504):
+                time.sleep(3 * (attempt + 1))
+                continue
+            r.raise_for_status()
+        except requests.Timeout:
+            time.sleep(2)
+    raise ConnectionError(f"Databricks API failed after 3 attempts. Endpoint: {self.endpoint}")
+
+DatabricksModelClient.chat = _db_chat
+
+# Patch Classifier.classify to accept optional 'sources' kwarg (pipeline.py passes it)
+from classifier import Classifier
+_orig_classify = Classifier.classify
+
+def _patched_classify(self, company, context, sources=None):
+    result = _orig_classify(self, company, context)
+    if sources:
+        result.sources = sources
+    return result
+
+Classifier.classify = _patched_classify
+
+# Reload pipeline module so it uses the patched classes
+for mod_name in list(sys.modules.keys()):
+    if mod_name in ('pipeline', 'prescreener'):
+        del sys.modules[mod_name]
+
+import shutil
+import tempfile
 from pipeline import run_pipeline
+
+# Write to local temp dir first (Volumes FUSE doesn't support seek for xlsx/zip writes)
+_tmp_dir = tempfile.mkdtemp(prefix="market_signals_")
+_tmp_xlsx = os.path.join(_tmp_dir, os.path.basename(OUTPUT_XLSX))
 
 start = time.time()
 
 results = run_pipeline(
     input_csv=INPUT_CSV,
-    output_xlsx=OUTPUT_XLSX,
+    output_xlsx=_tmp_xlsx,
     tavily_key=config.TAVILY_API_KEY if not config.TAVILY_API_KEY.startswith("tvly-YOUR") else None,
     resume=RESUME,
 )
+
+# Copy result to the Volumes destination
+os.makedirs(os.path.dirname(OUTPUT_XLSX), exist_ok=True)
+shutil.copy2(_tmp_xlsx, OUTPUT_XLSX)
+shutil.rmtree(_tmp_dir, ignore_errors=True)
 
 elapsed = time.time() - start
 mins, secs = divmod(int(elapsed), 60)
