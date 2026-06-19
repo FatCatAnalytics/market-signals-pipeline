@@ -2,13 +2,13 @@
 # MAGIC %md
 # MAGIC # Market Signals Pipeline — Manual Databricks Runner
 # MAGIC
-# MAGIC This notebook is intended to be run manually from a Databricks Job.
+# MAGIC This notebook is intended to be run manually or from a Databricks Job.
 # MAGIC It reads a company list CSV from a Unity Catalog Volume, runs the pipeline,
 # MAGIC and writes the Excel report back to a Volume.
 
 # COMMAND ----------
 
-# MAGIC %pip install -r ../requirements.txt
+# MAGIC %pip install tavily-python requests openpyxl
 
 # COMMAND ----------
 
@@ -22,12 +22,12 @@ import importlib
 # Databricks Job parameters. These can be overridden with "Run now with different parameters".
 dbutils.widgets.text(
     "pipeline_dir",
-    "/Workspace/Users/aetingu@gmail.com/market-signals-pipeline",
+    "/Workspace/Users/aksel.etingu@crisil.com/market-signals-pipeline",
 )
 
 dbutils.widgets.text(
     "input_csv",
-    "/Volumes/data_poc_ws/default/client_intelligence_analytics/market_signals/input/company_list_sample.csv",
+    "/Volumes/data_poc_ws/default/client_intelligence_analytics/market_signals/input/company_list.csv",
 )
 
 dbutils.widgets.text(
@@ -47,6 +47,17 @@ dbutils.widgets.dropdown(
     ["true", "false"],
 )
 
+dbutils.widgets.dropdown(
+    "time_horizon_months",
+    "12",
+    ["6", "12", "24"],
+)
+
+dbutils.widgets.text(
+    "max_companies",
+    "0",
+)
+
 dbutils.widgets.text(
     "classifier_endpoint",
     "databricks-qwen3-next-80b-a3b-instruct",
@@ -64,6 +75,8 @@ INPUT_CSV = dbutils.widgets.get("input_csv")
 OUTPUT_XLSX = dbutils.widgets.get("output_xlsx")
 RESUME = dbutils.widgets.get("resume").lower() == "true"
 USE_TAVILY = dbutils.widgets.get("use_tavily").lower() == "true"
+TIME_HORIZON_MONTHS = dbutils.widgets.get("time_horizon_months")
+MAX_COMPANIES = int((dbutils.widgets.get("max_companies") or "0").strip())
 CLASSIFIER_ENDPOINT = dbutils.widgets.get("classifier_endpoint")
 PRESCREENER_ENDPOINT = dbutils.widgets.get("prescreener_endpoint")
 
@@ -77,11 +90,15 @@ print(f"Input CSV            : {INPUT_CSV}")
 print(f"Output XLSX          : {OUTPUT_XLSX}")
 print(f"Resume               : {RESUME}")
 print(f"Use Tavily           : {USE_TAVILY}")
+print(f"Time horizon months  : {TIME_HORIZON_MONTHS}")
+print(f"Max companies        : {MAX_COMPANIES if MAX_COMPANIES else 'ALL'}")
 print(f"Classifier endpoint  : {CLASSIFIER_ENDPOINT}")
 print(f"Prescreener endpoint : {PRESCREENER_ENDPOINT}")
 print(f"Pipeline dir exists  : {os.path.exists(PIPELINE_DIR)}")
 print(f"Input CSV exists     : {os.path.exists(INPUT_CSV)}")
 
+if not os.path.exists(PIPELINE_DIR):
+    raise FileNotFoundError(f"Pipeline dir not found: {PIPELINE_DIR}")
 if not os.path.exists(INPUT_CSV):
     raise FileNotFoundError(f"Input CSV not found: {INPUT_CSV}")
 
@@ -97,6 +114,8 @@ os.environ["DATABRICKS_HOST"] = host
 os.environ["USE_DATABRICKS_MODEL"] = "True"
 os.environ["DATABRICKS_CLASSIFIER_ENDPOINT"] = CLASSIFIER_ENDPOINT
 os.environ["DATABRICKS_PRESCREENER_ENDPOINT"] = PRESCREENER_ENDPOINT
+os.environ["TIME_HORIZON_MONTHS"] = TIME_HORIZON_MONTHS
+os.environ["MAX_COMPANIES"] = str(MAX_COMPANIES)
 
 print(f"Detected Databricks host: {host}")
 
@@ -130,6 +149,11 @@ print(f"DATABRICKS_HOST        : {config.DATABRICKS_HOST[:40]}...")
 print(f"DATABRICKS_CLASSIFIER  : {config.DATABRICKS_CLASSIFIER_ENDPOINT}")
 print(f"DATABRICKS_PRESCREENER : {config.DATABRICKS_PRESCREENER_ENDPOINT}")
 print(f"TAVILY_API_KEY set     : {not config.TAVILY_API_KEY.startswith('tvly-YOUR')}")
+print(f"TIME_HORIZON_MONTHS    : {config.TIME_HORIZON_MONTHS}")
+print(f"DATE_START             : {config.DATE_START}")
+print(f"DATE_END               : {config.DATE_END}")
+print(f"DATE_RANGE             : {config.DATE_RANGE}")
+print(f"MAX_COMPANIES default  : {config.DEFAULT_MAX_COMPANIES}")
 print(f"MIN_CONFIDENCE         : {config.MIN_CONFIDENCE}")
 print(f"PRESCREEN_MIN_SCORE    : {config.PRESCREEN_MIN_SCORE}")
 
@@ -154,71 +178,28 @@ print(f"Model test response: {response.strip()}")
 
 # COMMAND ----------
 
-# DBTITLE 1,Run pipeline
-from databricks_client import DatabricksModelClient
-import requests
+# Reload pipeline modules after config/env changes so repeated notebook runs stay clean.
+import search
+import classifier
+import prescreener
+import pipeline
 
-# Patch DatabricksModelClient with a .chat() method to match LlamaServerClient interface
-def _db_chat(self, messages, max_tokens=1200, temperature=0.0):
-    payload = {"messages": messages, "max_tokens": max_tokens, "temperature": temperature}
-    headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
-    for attempt in range(3):
-        try:
-            r = requests.post(self.url, headers=headers, json=payload, timeout=self.timeout_sec)
-            if r.status_code == 200:
-                return r.json()["choices"][0]["message"]["content"].strip()
-            if r.status_code == 429:
-                wait = min(int(r.headers.get("Retry-After", 5 * (attempt + 1))), 30)
-                time.sleep(wait)
-                continue
-            if r.status_code in (500, 502, 503, 504):
-                time.sleep(3 * (attempt + 1))
-                continue
-            r.raise_for_status()
-        except requests.Timeout:
-            time.sleep(2)
-    raise ConnectionError(f"Databricks API failed after 3 attempts. Endpoint: {self.endpoint}")
+importlib.reload(search)
+importlib.reload(classifier)
+importlib.reload(prescreener)
+importlib.reload(pipeline)
 
-DatabricksModelClient.chat = _db_chat
-
-# Patch Classifier.classify to accept optional 'sources' kwarg (pipeline.py passes it)
-from classifier import Classifier
-_orig_classify = Classifier.classify
-
-def _patched_classify(self, company, context, sources=None):
-    result = _orig_classify(self, company, context)
-    if sources:
-        result.sources = sources
-    return result
-
-Classifier.classify = _patched_classify
-
-# Reload pipeline module so it uses the patched classes
-for mod_name in list(sys.modules.keys()):
-    if mod_name in ('pipeline', 'prescreener'):
-        del sys.modules[mod_name]
-
-import shutil
-import tempfile
 from pipeline import run_pipeline
-
-# Write to local temp dir first (Volumes FUSE doesn't support seek for xlsx/zip writes)
-_tmp_dir = tempfile.mkdtemp(prefix="market_signals_")
-_tmp_xlsx = os.path.join(_tmp_dir, os.path.basename(OUTPUT_XLSX))
 
 start = time.time()
 
 results = run_pipeline(
     input_csv=INPUT_CSV,
-    output_xlsx=_tmp_xlsx,
+    output_xlsx=OUTPUT_XLSX,
     tavily_key=config.TAVILY_API_KEY if not config.TAVILY_API_KEY.startswith("tvly-YOUR") else None,
     resume=RESUME,
+    max_companies=MAX_COMPANIES,
 )
-
-# Copy result to the Volumes destination
-os.makedirs(os.path.dirname(OUTPUT_XLSX), exist_ok=True)
-shutil.copy2(_tmp_xlsx, OUTPUT_XLSX)
-shutil.rmtree(_tmp_dir, ignore_errors=True)
 
 elapsed = time.time() - start
 mins, secs = divmod(int(elapsed), 60)
@@ -235,6 +216,7 @@ print("MARKET SIGNALS SUMMARY")
 print("=" * 60)
 print(f"Total companies : {len(results)}")
 print(f"With signals    : {signals_found}")
+print(f"Date range      : {config.DATE_RANGE}")
 print(f"Output          : {OUTPUT_XLSX}")
 print("=" * 60)
 
@@ -243,5 +225,5 @@ for r in results:
         print(f"{r.company:45s} {r.total_signals} signal(s) - {r.summary}")
 
 dbutils.notebook.exit(
-    f"Completed. Companies={len(results)}, Signals={signals_found}, Output={OUTPUT_XLSX}"
+    f"Completed. Companies={len(results)}, Signals={signals_found}, Horizon={config.DATE_RANGE}, Output={OUTPUT_XLSX}"
 )
