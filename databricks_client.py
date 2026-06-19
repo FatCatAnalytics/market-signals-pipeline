@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import os
 import time
-import json
 from typing import Optional
 
 import requests
@@ -91,6 +90,29 @@ class DatabricksModelClient:
             "max_tokens":  max_tokens,
             "temperature": temperature,
         }
+        return self._invoke(payload)
+
+    def chat(
+        self,
+        messages:    list[dict],
+        max_tokens:  int   = 600,
+        temperature: float = 0.0,
+    ) -> str:
+        """
+        Compatibility wrapper for local llama-server style callers.
+
+        Some existing pipeline code calls client.chat(messages=[...]).
+        Databricks serving accepts the same message payload, so this wrapper
+        keeps older code paths working while complete(...) remains preferred.
+        """
+        payload = {
+            "messages":    messages,
+            "max_tokens":  max_tokens,
+            "temperature": temperature,
+        }
+        return self._invoke(payload)
+
+    def _invoke(self, payload: dict) -> str:
         headers = {
             "Authorization": f"Bearer {self.token}",
             "Content-Type":  "application/json",
